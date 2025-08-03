@@ -8,14 +8,15 @@ from email.mime.text import MIMEText
 from email.mime.multipart import MIMEMultipart
 from bson import ObjectId
 import requests
-import bcrypt
 import secrets
 from datetime import datetime, timedelta
 import jwt
+from flask_bcrypt import Bcrypt
 
 app = Flask(__name__)
-CORS(app, supports_credentials=True)
+CORS(app, resources={r"/*": {"origins": "http://localhost:5173"}}, supports_credentials=True)
 load_dotenv()
+bcrypt = Bcrypt(app)
 
 # Configuration
 app.secret_key = secrets.token_hex(32)
@@ -28,12 +29,11 @@ db = client["smart_agro"]
 users_collection = db["users"]
 messages_collection = db["messages"]
 
-# Helper functions
-def hash_password(password):
-    return bcrypt.hashpw(password.encode('utf-8'), bcrypt.gensalt())
 
-def check_password(password, hashed):
-    return bcrypt.checkpw(password.encode('utf-8'), hashed)
+
+# Check password function
+def check_password(plain_password, hashed_password):
+    return bcrypt.check_password_hash(hashed_password, plain_password)
 
 # Authentication routes
 @app.route("/api/auth/signup", methods=["POST"])
@@ -54,7 +54,8 @@ def signup():
             return jsonify({"message": "Username already taken"}), 409
 
         # Hash password before storing
-        hashed_password = hash_password(data["password"])
+        hashed_password = bcrypt.generate_password_hash(data["password"]).decode("utf-8")
+
 
         user = {
             "fullName": data["fullName"],
@@ -76,8 +77,10 @@ def signup():
         session['user_id'] = user_id
         session.permanent = True
 
-        # Return user data (without password)
+        # Remove password and _id from response (or convert _id)
         user.pop('password', None)
+        user['_id'] = user_id  # replace ObjectId with string
+        
         return jsonify({
             "message": "Signup successful",
             "user": user
@@ -100,13 +103,19 @@ def login():
         # Find user by username or email
         user = users_collection.find_one({
             "$or": [
-                {"username": username},
-                {"email": username}
-            ]
+        {"username": username},
+        {"email": username}
+    ]
         })
 
         if not user:
             return jsonify({"message": "Invalid credentials"}), 401
+        
+        # Debugging output
+        print("Hashed password in DB:", user['password'])
+        print("Entered password:", password)
+        print("Password match result:", check_password(password, user['password']))
+
 
         # Verify password
         if not check_password(password, user['password']):
@@ -223,6 +232,79 @@ def google_oauth():
         print(f"Google OAuth error: {str(e)}")
         return jsonify({"message": "Google login failed"}), 400
 
+@app.route("/github-login", methods=["POST"])
+def github_login():
+    try:
+        code = request.json.get("code")
+        if not code:
+            return jsonify({"message": "Missing code"}), 400
+
+        # Exchange code for access token
+        client_id = os.getenv("GITHUB_CLIENT_ID")
+        client_secret = os.getenv("GITHUB_CLIENT_SECRET")
+        token_res = requests.post(
+            "https://github.com/login/oauth/access_token",
+            headers={"Accept": "application/json"},
+            data={
+                "client_id": client_id,
+                "client_secret": client_secret,
+                "code": code
+            }
+        )
+        token_res.raise_for_status()
+        token_data = token_res.json()
+        access_token = token_data.get("access_token")
+
+        if not access_token:
+            return jsonify({"message": "Access token not received"}), 401
+
+        # Fetch user info
+        user_res = requests.get(
+            "https://api.github.com/user",
+            headers={"Authorization": f"token {access_token}"}
+        )
+        user_res.raise_for_status()
+        user_info = user_res.json()
+
+        email = user_info.get("email") or f"{user_info['id']}@github.com"
+        username = user_info["login"]
+
+        # Check if user exists in DB
+        user = users_collection.find_one({"email": email})
+        if not user:
+            user = {
+                "username": username,
+                "email": email,
+                "github_id": user_info["id"],
+                "fullName": user_info.get("name"),
+                "createdAt": datetime.utcnow()
+            }
+            result = users_collection.insert_one(user)
+            user["_id"] = result.inserted_id
+
+        session["user_id"] = str(user["_id"])
+        session.permanent = True
+
+        return jsonify({
+            "message": "GitHub login successful",
+            "user": {
+                "id": str(user["_id"]),
+                "username": user["username"],
+                "email": user["email"],
+                "fullName": user.get("fullName")
+            }
+        }), 200
+
+    except Exception as e:
+        print("GitHub login error:", str(e))
+        print("Received code:", code)
+        print("Client ID:", client_id)
+        print("Client Secret:", client_secret)
+        print("Token response:", token_data)
+
+        return jsonify({"message": "GitHub login failed"}), 500
+
+
 # Contact route (updated)
 @app.route("/api/contact", methods=["POST"])
 def contact():
@@ -243,8 +325,10 @@ def contact():
         messages_collection.insert_one(message_entry)
 
         # Send email notification (optional)
+        print("Incoming contact data:", data)
         email_user = os.getenv("EMAIL_USER")
         email_pass = os.getenv("EMAIL_PASS")
+        print("EMAIL_USER:", email_user) 
         
         if email_user and email_pass:
             msg = MIMEMultipart()
@@ -266,6 +350,7 @@ def contact():
     except Exception as e:
         print(f"Contact form error: {str(e)}")
         return jsonify({"message": "Server error processing message"}), 500
+
 
 if __name__ == "__main__":
     app.run(debug=True, host="0.0.0.0", port=5000)
