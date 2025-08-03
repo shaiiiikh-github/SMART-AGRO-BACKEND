@@ -12,6 +12,12 @@ import secrets
 from datetime import datetime, timedelta
 import jwt
 from flask_bcrypt import Bcrypt
+from flask_bcrypt import Bcrypt
+from werkzeug.utils import secure_filename
+import pickle
+from PIL import Image
+import numpy as np
+import io
 
 app = Flask(__name__)
 CORS(app, resources={r"/*": {"origins": "http://localhost:5173"}}, supports_credentials=True)
@@ -21,6 +27,9 @@ bcrypt = Bcrypt(app)
 # Configuration
 app.secret_key = secrets.token_hex(32)
 app.config['PERMANENT_SESSION_LIFETIME'] = timedelta(days=7)  # Session expires after 7 days
+app.config['UPLOAD_FOLDER'] = 'uploads'
+app.config['MAX_CONTENT_LENGTH'] = 5 * 1024 * 1024  # 5MB limit
+ALLOWED_EXTENSIONS = {'png', 'jpg', 'jpeg'}
 
 # MongoDB setup
 mongo_uri = os.getenv("MONGO_URI")
@@ -28,6 +37,65 @@ client = MongoClient(mongo_uri)
 db = client["smart_agro"]
 users_collection = db["users"]
 messages_collection = db["messages"]
+
+
+MODEL_PATH = os.getenv('MODEL_PATH', 'model.pkl')
+try:
+    model = pickle.load(open(MODEL_PATH, 'rb'))
+    print("Model loaded successfully")
+except Exception as e:
+    print(f"Failed to load model: {str(e)}")
+    model = None
+
+def allowed_file(filename):
+    return '.' in filename and \
+           filename.rsplit('.', 1)[1].lower() in ALLOWED_EXTENSIONS
+
+def preprocess_image(image_bytes):
+    img = Image.open(io.BytesIO(image_bytes))
+    img = img.resize((224, 224))  # Adjust size as needed for your model
+    if img.mode != 'RGB':
+        img = img.convert('RGB')
+    img_array = np.array(img)
+    return img_array.reshape(1, -1)  # Adjust reshape as needed
+
+@app.route('/api/analyze', methods=['POST'])
+def analyze_image():
+    try:
+        # Check if image was sent
+        if 'image' not in request.files:
+            return jsonify({'error': 'No image uploaded'}), 400
+            
+        file = request.files['image']
+        
+        # Check if file is empty
+        if file.filename == '':
+            return jsonify({'error': 'No selected file'}), 400
+            
+        # Check file extension
+        if not allowed_file(file.filename):
+            return jsonify({'error': 'Invalid file type. Only JPG, PNG allowed'}), 400
+            
+        # Verify model is loaded
+        if model is None:
+            return jsonify({'error': 'Model not available'}), 500
+            
+        # Read and process image
+        image_bytes = file.read()
+        processed_image = preprocess_image(image_bytes)
+        
+        # Make prediction
+        prediction = model.predict(processed_image)
+        
+        return jsonify({
+            'prediction': prediction.tolist(),
+            'message': 'Analysis complete'
+        }), 200
+        
+    except Exception as e:
+        print(f"Error analyzing image: {str(e)}")
+        return jsonify({'error': 'Failed to process image'}), 500
+
 
 
 
